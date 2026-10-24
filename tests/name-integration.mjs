@@ -1,0 +1,103 @@
+import {createRequire} from 'node:module';
+import {readFile,readdir} from 'node:fs/promises';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {hashPassword,randomSession,digest} from '../lib/password.mjs';
+const require=createRequire(import.meta.url),{Miniflare}=createRequire(require.resolve('wrangler/package.json'))('miniflare');
+const root=path.resolve('dist/server'),files=(await readdir(root,{recursive:true})).filter(file=>/\.m?js$/.test(file)).sort((a,b)=>a==='index.js'?-1:b==='index.js'?1:a.localeCompare(b));
+const mf=new Miniflare({modules:files.map(file=>({type:'ESModule',path:path.join(root,file)})),modulesRoot:root,compatibilityDate:'2026-05-15',compatibilityFlags:['nodejs_compat'],d1Databases:['DB'],r2Buckets:['BUCKET'],cf:false});
+const origin='https://classroom.test',post=(route,body,user={})=>mf.dispatchFetch(origin+route,{method:'POST',headers:{origin,'content-type':'application/json',...user},body:JSON.stringify(body)});
+async function expect(response,status,label){if(response.status!==status)throw Error(label+': '+response.status+' '+await response.text());return response;}
+const json=async(body,user,status=200)=>(await expect(await post('/api/auth',body,user),status,body.op)).json();
+const password='Name-validation-password-123!';
+const cookie=response=>({cookie:response.headers.getSetCookie().map(x=>x.split(';')[0]).join('; ')});
+try{
+ const db=await mf.getD1Database('DB');
+ for(const file of (await readdir('drizzle')).filter(f=>f.endsWith('.sql')).sort()){
+  if(file.startsWith('0006_'))await db.prepare('INSERT INTO login_accounts (user_id,username,name,email,password_hash,created) VALUES (?,?,?,?,?,1)').bind('legacy','legacy','ชื่อนักเรียนเดิม','legacy@example.test',hashPassword(password)).run();
+  if(file.startsWith('0007_'))await db.prepare("INSERT INTO login_accounts (user_id,username,name,first_name,last_name,name_status,email,password_hash,created) VALUES ('auto-old','auto.old','สมชาย ใจดี','สมชาย','ใจดี','pending','auto@example.test',?,1)").bind(hashPassword(password)).run();
+  for(const sql of (await readFile('drizzle/'+file,'utf8')).split('--> statement-breakpoint').map(s=>s.trim()).filter(Boolean))await db.prepare(sql).run();
+ }
+ const old=await db.prepare("SELECT name,first_name,last_name,name_status FROM login_accounts WHERE user_id='legacy'").first();assert.deepEqual(old,{name:'ชื่อนักเรียนเดิม',first_name:'',last_name:'',name_status:'legacy'},'migration preserves legacy names');
+ assert.deepEqual(await db.prepare("SELECT name_status,name_version FROM login_accounts WHERE user_id='auto-old'").first(),{name_status:'format_ok',name_version:2},'previously corrected normal names are accepted automatically');
+ await db.prepare("INSERT INTO settings (key,value) VALUES ('owner','teacher')").run();
+ await db.prepare('INSERT INTO login_accounts (user_id,username,name,email,password_hash,created) VALUES (?,?,?,?,?,1)').bind('teacher','teacher','Teacher Owner','teacher@example.test',hashPassword(password)).run();
+ const token=randomSession();await db.prepare('INSERT INTO login_sessions (token_hash,user_id,account_version,device_id,expires) VALUES (?,?,1,?,?)').bind(digest(token),'teacher','device',Date.now()+3600000).run();const teacher={cookie:'__Host-yingyai-session='+token};
+ await db.prepare("INSERT INTO courses (id,title,description,category,published,visibility,created) VALUES ('public','All students','','Test',1,'all',1)").run();
+ await db.prepare("INSERT INTO lessons (id,course_id,title,description,position,created) VALUES ('lesson','public','Lesson','',0,1)").run();
+ const bucket=await mf.getR2Bucket('BUCKET');await bucket.put('protected-media','abcdef');
+ for(const [id,kind] of [['video','video'],['document','pdf']])await db.prepare('INSERT INTO files (id,lesson_id,name,kind,size,object_key,created) VALUES (?,?,?,?,?,?,1)').bind(id,'lesson',id,kind,6,'protected-media').run();
+ await db.prepare("INSERT INTO exam_images (id,course_id,name,content_type,size,object_key,created) VALUES ('picture','public','image.png','image/png',6,'protected-media',1)").run();
+ const questions=[{id:'q',kind:'numeric',prompt:'1+1',imageId:'picture',choices:[],answer:'2',tolerance:'0',points:1,explanation:''}];
+ await db.prepare("INSERT INTO exams (id,course_id,title,questions,published,show_answers,revision,created,updated) VALUES ('exam','public','Exam',?,1,0,1,1,1)").bind(JSON.stringify(questions)).run();
+ const media=(id,user)=>mf.dispatchFetch(origin+'/api/media/'+id,{headers:user});
+ const registration={op:'register',username:'normal',password,firstName:'สมใจ',lastName:'ใฝ่เรียน',nickname:'ใจ',grade:'ม.4',school:'โรงเรียนตัวอย่าง'};
+ for(const firstName of ['😀','สมชาย123','https://example.com'])await json({...registration,username:'bad-'+crypto.randomUUID().slice(0,8),firstName},undefined,400);
+ await json({...registration,firstName:'',name:'สมใจ ใฝ่เรียน'},undefined,400);
+ for(const [username,firstName] of [['placeholder','ทดสอบ'],['offensive','เหี้ย']]){
+  await json({...registration,username,firstName},undefined,400);
+  const submitted=await json({...registration,username,firstName,nameConfirmed:true},undefined,201);assert.equal(submitted.approvalRequired,true);
+ assert.equal((await db.prepare('SELECT name_status FROM login_accounts WHERE username=?').bind(username).first()).name_status,'pending');
+ }
+ const english={...registration,username:'review.english',firstName:'wefvev',lastName:'verve'};
+ await json({...english,name_status:'approved',name_flags:[],instructor:true},undefined,400);
+ assert.equal((await db.prepare("SELECT COUNT(*) AS n FROM login_accounts WHERE username='review.english'").first()).n,0);
+ await json({...english,nameConfirmed:true,role:'admin',userId:'teacher',name_status:'approved'},undefined,201);
+ const englishAccount=await db.prepare("SELECT * FROM login_accounts WHERE username='review.english'").first();assert.equal(englishAccount.name_status,'pending');assert.ok(JSON.parse(englishAccount.name_flags).includes('unusual_latin'));assert.notEqual(englishAccount.user_id,'teacher');
+ const thai={...registration,username:'review.thai',firstName:'อะอะ',lastName:'อุอุง',nameConfirmed:true};await json(thai,undefined,201);
+ const thaiAccount=await db.prepare("SELECT * FROM login_accounts WHERE username='review.thai'").first();assert.equal(thaiAccount.name_status,'pending');assert.ok(JSON.parse(thaiAccount.name_flags).includes('repeated'));
+ await json({...registration,name_status:'approved',name_flags:['fake'],name_reviewed_by:'teacher'},undefined,201);
+ const normal=await db.prepare("SELECT * FROM login_accounts WHERE username='normal'").first();assert.equal(normal.name_status,'format_ok');assert.equal(normal.name_reviewed_by,null);assert.deepEqual(JSON.parse(normal.name_flags),[]);
+ let response=await expect(await post('/api/auth',{op:'login',username:english.username,password}),200,'review names do not block login'),student=cookie(response);
+ const load=async(user)=>(await expect(await post('/api/classroom',{op:'load'},user),200,'load')).json();
+ let payload=await load(student);assert.equal(payload.user.nameStatus,'pending');assert.deepEqual(payload.accounts,[]);assert.equal(payload.courses.length,0,'pending students cannot see public courses');
+ assert.equal(payload.user.nameApprovalRequired,true);
+ for(const id of ['video','document'])await expect(await media(id,student),403,'pending student direct media blocked');
+ await expect(await mf.dispatchFetch(origin+'/api/exam-images/picture',{headers:student}),403,'pending student direct image blocked');
+ await expect(await post('/api/exams',{op:'get',examId:'exam'},student),403,'pending student direct exam blocked');
+ await expect(await post('/api/exams',{op:'submit',examId:'exam',revision:1,attemptId:crypto.randomUUID(),responses:[{questionId:'q',value:'2'}]},student),403,'pending student cannot submit exam');
+ await expect(await post('/api/classroom',{op:'progress',lessonId:'lesson',done:true},student),403,'pending student cannot save progress');
+ const normalSession=cookie(await expect(await post('/api/auth',{op:'login',username:'normal',password}),200,'normal student login'));
+ const normalPayload=await load(normalSession);assert.equal(normalPayload.user.nameApprovalRequired,false);assert.equal(normalPayload.courses[0].id,'public');
+ await expect(await media('video',normalSession),200,'normal student immediately has access');
+ const score=await (await expect(await post('/api/exams',{op:'submit',examId:'exam',revision:1,attemptId:crypto.randomUUID(),responses:[{questionId:'q',value:'2'}]},normalSession),200,'auto-approved student can submit immediately')).json();assert.equal(score.attempt.score,1);
+ payload=await load(teacher);assert.equal(payload.accounts.filter(a=>a.name_status==='pending').length,4,'owner sees review queue');
+ await json({op:'reviewName',userId:englishAccount.user_id,nameVersion:1,action:'approve'},student,403);
+ await json({op:'reviewName',userId:'teacher',nameVersion:1,action:'approve'},teacher,400);
+ await json({op:'reviewName',userId:englishAccount.user_id,nameVersion:1,action:'approve'},teacher);
+ await expect(await media('video',student),200,'teacher approval unlocks access without a new login');
+ assert.equal((await db.prepare('SELECT name_status FROM login_accounts WHERE user_id=?').bind(englishAccount.user_id).first()).name_status,'approved');
+ await json({op:'reviewName',userId:englishAccount.user_id,nameVersion:1,action:'requestChange'},teacher,409);
+ await json({op:'updateName',firstName:'สมชาย',lastName:'ใจดี',nameVersion:2},student,403,'approved names cannot self-rewrite');
+ await json({op:'reviewName',userId:englishAccount.user_id,nameVersion:2,action:'requestChange',note:'กรุณาใส่ชื่อตามรายชื่อผู้เรียน'},teacher);
+ payload=await load(student);assert.equal(payload.user.nameStatus,'needs_change');assert.equal(payload.user.nameVersion,3);assert.equal(payload.user.nameReviewNote,'กรุณาใส่ชื่อตามรายชื่อผู้เรียน');await expect(await media('video',student),403,'name correction request blocks old session access');
+ await db.prepare('INSERT INTO enrollments (id,course_id,email,user_id,name,status,created) VALUES (?,?,?,?,?,?,1)').bind('e','public',englishAccount.email,englishAccount.user_id,englishAccount.name,'active').run();
+ await json({op:'updateName',firstName:'สมชาย',lastName:'ใจดี',nameVersion:2},student,409);
+ await json({op:'updateName',firstName:'ทดสอบ',lastName:'ใจดี',nameVersion:3},student,400);
+ await json({op:'updateName',userId:thaiAccount.user_id,firstName:'สมชาย',lastName:'ใจดี',nameVersion:3},student,403);
+ await json({op:'updateName',firstName:'สมชาย',lastName:'ใจดี',nameVersion:3,name_status:'approved',name_reviewed_by:'teacher'},student);
+ payload=await load(student);assert.equal(payload.user.name,'สมชาย ใจดี');assert.equal(payload.user.nameStatus,'format_ok');assert.equal(payload.user.nameApprovalRequired,false);assert.equal(payload.user.nameVersion,4);assert.equal(payload.user.nameReviewNote,'');
+ for(const [table,key] of [['people','id'],['enrollments','user_id']])assert.equal((await db.prepare(`SELECT name FROM ${table} WHERE ${key}=?`).bind(englishAccount.user_id).first()).name,'สมชาย ใจดี','name stays consistent across profile and enrollment');
+ await json({op:'reviewName',userId:englishAccount.user_id,nameVersion:3,action:'approve'},teacher,409,'stale review cannot approve a different name');
+ await expect(await media('video',student),200,'corrected normal name unlocks immediately without teacher action');
+ const accepted=await db.prepare('SELECT name_status,name_reviewed_by,name_version FROM login_accounts WHERE user_id=?').bind(englishAccount.user_id).first();assert.deepEqual(accepted,{name_status:'format_ok',name_reviewed_by:null,name_version:4});
+ await json({op:'create',username:'instructor.checked',firstName:'Qasim',lastName:'Smith',password},teacher);
+ assert.equal((await db.prepare("SELECT name_status FROM login_accounts WHERE username='instructor.checked'").first()).name_status,'approved','owner-provided names are explicitly checked by instructor');
+ response=await expect(await post('/api/auth',{op:'login',username:'legacy',password}),200,'legacy student login');const legacy=cookie(response);payload=await load(legacy);assert.equal(payload.user.nameStatus,'legacy');
+ assert.equal((await mf.dispatchFetch(origin+'/api/auth',{method:'POST',headers:{origin:'https://evil.test','content-type':'application/json',...teacher},body:JSON.stringify({op:'reviewName',userId:thaiAccount.user_id,nameVersion:1,action:'approve'})})).status,403,'review CSRF blocked');
+ for(const [username,firstName,lastName,flag] of [['repeat.three','aaa','ddd','repeated'],['random.latin','svrnhj','Smith','unusual_latin'],['random.thai','สมชาย','กหีำพด','unusual_thai']]){
+  const candidate={...registration,username,firstName,lastName,name_status:'approved',name_flags:[]};
+  await json(candidate,undefined,400);
+  const submitted=await json({...candidate,nameConfirmed:true},undefined,201);assert.equal(submitted.approvalRequired,true);
+  const account=await db.prepare('SELECT name_status,name_flags FROM login_accounts WHERE username=?').bind(username).first();assert.equal(account.name_status,'pending');assert.ok(JSON.parse(account.name_flags).includes(flag));
+  const session=cookie(await expect(await post('/api/auth',{op:'login',username,password}),200,'flagged student login'));
+  const waiting=await load(session);assert.equal(waiting.user.nameApprovalRequired,true);assert.equal(waiting.courses.length,0);
+  await expect(await media('video',session),403,'new screening flags block lesson access');
+  await expect(await post('/api/exams',{op:'get',examId:'exam'},session),403,'new screening flags block exams');
+  const correction=username==='repeat.three'?{firstName:'นนน',lastName:'กกก'}:{firstName:'Anna',lastName:'Schmidt'};
+  await json({op:'updateName',...correction,nameVersion:1},session);
+  const corrected=await load(session);assert.equal(corrected.user.nameApprovalRequired,false);assert.equal(corrected.user.nameStatus,'format_ok');
+  await expect(await media('video',session),200,'ordinary names and Thai triple exceptions auto-approve');
+ }
+ console.log('PASS: split names, anti-bypass checks, three repeated letters and random Latin/Thai spelling queued, owner-only review, self-correction, stale-review protection, consistent names, legacy preservation, pending access gates and immediate automatic approval for normal names.');
+}finally{await mf.dispose()}

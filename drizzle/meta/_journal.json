@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1791655406729,
+      "tag": "0000_oval_medusa",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1791738112169,
+      "tag": "0001_smooth_karen_page",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1791816052470,
+      "tag": "0002_sturdy_xavin",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792546144009,
+      "tag": "0003_powerful_satana",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1792588830059,
+      "tag": "0004_married_micromax",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1792602000000,
+      "tag": "0005_yingyai_assistant",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1792661857753,
+      "tag": "0006_student_names",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1792671392588,
+      "tag": "0007_name_auto_accept",
+      "breakpoints": true
+    }
+  ]
+}
